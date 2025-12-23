@@ -1,0 +1,301 @@
+# src/preprocessing.py
+"""
+Preprocessing helpers for fraud detection Task 1.
+
+Usage:
+    from src.preprocessing import (
+        load_data,
+        clean_fraud_df,
+        map_ip_to_country,
+        engineer_fraud_features,
+        train_test_time_split,
+        build_preprocessing_pipeline,
+        apply_resampling_smotecn
+    )
+"""
+
+import os
+import pandas as pd
+import numpy as np
+import ipaddress
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OrdinalEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from imblearn.over_sampling import SMOTE, SMOTENC
+from collections import Counter
+import joblib
+
+# ------------------------
+# 1) Load datasets
+# ------------------------
+def load_data(data_dir="data/raw"):
+    """
+    Expects:
+      - fraud: Fraud_Data.csv
+      - ip map: IpAddress_to_Country.csv
+      - creditcard: creditcard.csv
+    Returns:
+      pandas DataFrames: fraud_df, ipmap_df, cc_df
+    """
+    fraud_path = os.path.join(data_dir, "Fraud_Data.csv")
+    ipmap_path = os.path.join(data_dir, "IpAddress_to_Country.csv")
+    cc_path = os.path.join(data_dir, "creditcard.csv")
+
+    fraud_df = pd.read_csv(fraud_path)
+    ipmap_df = pd.read_csv(ipmap_path)
+    cc_df = pd.read_csv(cc_path)
+
+    return fraud_df, ipmap_df, cc_df
+
+# ------------------------
+# Utilities
+# ------------------------
+def ip_to_int(ip):
+    """Convert IPv4 dotted string to integer. If already int, returns int."""
+    if pd.isna(ip):
+        return np.nan
+    try:
+        # handle dotted string
+        return int(ipaddress.ip_address(ip))
+    except Exception:
+        # maybe it's already an integer representation as string
+        try:
+            return int(ip)
+        except Exception:
+            return np.nan
+
+# ------------------------
+# 2) Cleaning Fraud_Data
+# ------------------------
+def clean_fraud_df(df):
+    """
+    - Parse timestamps
+    - Drop exact duplicates
+    - Fix data types
+    - Basic missing value handling (impute or flag)
+    """
+    df = df.copy()
+
+    # parse timestamps
+    df['signup_time'] = pd.to_datetime(df['signup_time'], errors='coerce')
+    df['purchase_time'] = pd.to_datetime(df['purchase_time'], errors='coerce')
+
+    # drop duplicates
+    df = df.drop_duplicates()
+
+    # Convert age to numeric (coerce errors)
+    if 'age' in df.columns:
+        df['age'] = pd.to_numeric(df['age'], errors='coerce')
+
+    # Convert purchase_value
+    if 'purchase_value' in df.columns:
+        df['purchase_value'] = pd.to_numeric(df['purchase_value'], errors='coerce')
+
+    # IP address: keep original column, create integer column
+    if 'ip_address' in df.columns:
+        df['ip_int'] = df['ip_address'].apply(ip_to_int)
+
+    # Inspect missingness - do conservative imputation where necessary
+    # For example: if purchase_time missing -> drop (can't use transaction)
+    df = df[~df['purchase_time'].isna()].copy()
+
+    # Simple imputes for age and sex if needed (we'll keep simple strategy)
+    if 'age' in df.columns:
+        df['age'].fillna(df['age'].median(), inplace=True)
+    if 'sex' in df.columns:
+        df['sex'].fillna('U', inplace=True)  # U = unknown
+
+    return df
+
+# ------------------------
+# 3) IP range -> country mapping
+# ------------------------
+def map_ip_to_country(fraud_df, ipmap_df):
+    """
+    ipmap_df is expected to have:
+      - lower_bound_ip_address (int or dotted)
+      - upper_bound_ip_address (int or dotted)
+      - country
+    We'll convert bounds to integers and perform an interval join.
+    Returns fraud_df with new column 'ip_country'.
+    """
+    ipmap = ipmap_df.copy()
+
+    # convert bounds to ints (handle dotted or already int)
+    for col in ['lower_bound_ip_address', 'upper_bound_ip_address']:
+        if ipmap[col].dtype == object:
+            ipmap[col + '_int'] = ipmap[col].apply(ip_to_int)
+        else:
+            ipmap[col + '_int'] = ipmap[col].astype('Int64')
+
+    ipmap = ipmap.dropna(subset=['lower_bound_ip_address_int', 'upper_bound_ip_address_int'])
+
+    # create intervals and use pandas merge_asof-like technique:
+    # approach: sort ipmap by lower_bound, sort fraud by ip_int, then find the last ipmap lower_bound <= ip_int,
+    # and check ip_int <= upper_bound
+    ipmap_sorted = ipmap.sort_values('lower_bound_ip_address_int')[['lower_bound_ip_address_int','upper_bound_ip_address_int','country']].reset_index(drop=True)
+    fraud = fraud_df.copy().sort_values('ip_int').reset_index(drop=True)
+
+    # use numpy searchsorted
+    lower_bounds = ipmap_sorted['lower_bound_ip_address_int'].values
+    idxs = np.searchsorted(lower_bounds, fraud['ip_int'].values, side='right') - 1
+
+    ip_country = []
+    for pos, ip_val in zip(idxs, fraud['ip_int'].values):
+        if pos >= 0:
+            row = ipmap_sorted.iloc[pos]
+            if ip_val <= row['upper_bound_ip_address_int']:
+                ip_country.append(row['country'])
+            else:
+                ip_country.append(np.nan)
+        else:
+            ip_country.append(np.nan)
+
+    fraud['ip_country'] = ip_country
+    return fraud
+
+# ------------------------
+# 4) Feature engineering for Fraud_Data
+# ------------------------
+def engineer_fraud_features(df):
+    """
+    Adds:
+      - hour_of_day, day_of_week
+      - time_since_signup (seconds)
+      - is_new_user (signup->purchase < 24h)
+      - log_purchase_value
+      - tx_count_1h, tx_count_24h (per user)
+    """
+    df = df.copy()
+    df = df.sort_values(['user_id', 'purchase_time'])
+    # time features
+    df['hour_of_day'] = df['purchase_time'].dt.hour
+    df['day_of_week'] = df['purchase_time'].dt.dayofweek  # Monday=0
+
+    # time since signup in hours
+    df['time_since_signup_hours'] = (df['purchase_time'] - df['signup_time']).dt.total_seconds() / 3600.0
+    df['is_new_user'] = (df['time_since_signup_hours'] <= 24).astype(int)
+
+    # log transform of purchase_value (handle zero)
+    df['purchase_value_log'] = np.log1p(df['purchase_value'].fillna(0.0))
+
+    # transaction counts in windows per user: 1h and 24h
+    # For each user group, set purchase_time as index then rolling count
+    def rolling_counts(group, window):
+        g = group.set_index('purchase_time').sort_index()
+        # size() returns the number of rows in window (rolling with window as time offset)
+        return g['user_id'].rolling(window=window).count().reset_index(drop=True)
+
+    # compute per-user rolling counts and align back
+    tx_count_1h = []
+    tx_count_24h = []
+    for user, g in df.groupby('user_id'):
+        # the returned Series indices are same as group original order
+        rc1 = rolling_counts(g, '1h')
+        rc24 = rolling_counts(g, '24h')
+        tx_count_1h.extend(rc1.tolist())
+        tx_count_24h.extend(rc24.tolist())
+
+    df['tx_count_1h'] = tx_count_1h
+    df['tx_count_24h'] = tx_count_24h
+
+    # frequency encode device_id (simple)
+    dev_counts = df['device_id'].value_counts().to_dict()
+    df['device_id_freq'] = df['device_id'].map(dev_counts).fillna(0)
+
+    # fallback: fill country unknown as 'Unknown'
+    if 'ip_country' in df.columns:
+        df['ip_country'] = df['ip_country'].fillna('Unknown')
+
+    return df
+
+# ------------------------
+# 5) Train/test split (time-based)
+# ------------------------
+def train_test_time_split(df, time_col='purchase_time', test_size=0.2, shuffle=False):
+    """
+    Performs a time-based split: oldest (1 - test_size) for train, newest test_size for test.
+    This avoids leakage.
+    """
+    df = df.sort_values(time_col)
+    split_idx = int((1 - test_size) * len(df))
+    train = df.iloc[:split_idx].copy()
+    test = df.iloc[split_idx:].copy()
+    return train, test
+
+# ------------------------
+# 6) Preprocessing pipeline and resampling (SMOTENC example)
+# ------------------------
+def build_preprocessing_pipeline(numeric_features, categorical_features, onehot_low_cardinality=None):
+    """
+    Returns a ColumnTransformer pipeline for numeric + categorical preprocessing.
+    - numeric_features: list[str]
+    - categorical_features: list[str] (for ordinal encoding suitable for SMOTENC)
+    - onehot_low_cardinality: optional list[str] that will be OneHotEncoded instead.
+    """
+    # numeric pipeline
+    numeric_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+
+    # categorical pipeline (Ordinal for SMOTENC)
+    cat_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('ordinal', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1))
+    ])
+
+    transformers = []
+    transformers.append(('num', numeric_pipeline, numeric_features))
+    transformers.append(('cat', cat_pipeline, categorical_features))
+
+    preprocessor = ColumnTransformer(transformers=transformers, remainder='drop', verbose_feature_names_out=False)
+    return preprocessor
+
+def apply_resampling_smotecn(X_train, y_train, categorical_feature_indices):
+    """
+    X_train: numpy array after ordinal encoding for categorical features
+    categorical_feature_indices: list of integer column indices (in X_train) for categorical columns
+    Returns X_res, y_res
+    """
+    smote_nc = SMOTENC(categorical_features=categorical_feature_indices, random_state=42, n_jobs=-1)
+    X_res, y_res = smote_nc.fit_resample(X_train, y_train)
+    return X_res, y_res
+
+# ------------------------
+# 7) Convenience: run full preprocessing for Fraud_Data
+# ------------------------
+def preprocess_fraud_pipeline(data_dir="data/raw", processed_dir="data/processed", test_size=0.2):
+    os.makedirs(processed_dir, exist_ok=True)
+    fraud_df, ipmap_df, _ = load_data(data_dir=data_dir)
+
+    # clean
+    fraud_df = clean_fraud_df(fraud_df)
+
+    # map ip -> country
+    fraud_df = map_ip_to_country(fraud_df, ipmap_df)
+
+    # features
+    fraud_df = engineer_fraud_features(fraud_df)
+
+    # choose features for modeling (example)
+    features = [
+        'purchase_value_log', 'age', 'time_since_signup_hours', 'is_new_user',
+        'tx_count_1h', 'tx_count_24h', 'device_id_freq', 'hour_of_day', 'day_of_week',
+        'sex', 'source', 'browser', 'ip_country'
+    ]
+    target = 'class'
+
+    # keep rows with target not null
+    fraud_df = fraud_df[~fraud_df[target].isna()].copy()
+
+    # time-based split
+    train_df, test_df = train_test_time_split(fraud_df, time_col='purchase_time', test_size=test_size)
+
+    # save raw processed snapshots
+    train_df.to_parquet(os.path.join(processed_dir, 'fraud_train_raw.parquet'), index=False)
+    test_df.to_parquet(os.path.join(processed_dir, 'fraud_test_raw.parquet'), index=False)
+
+    return train_df, test_df, features, target
